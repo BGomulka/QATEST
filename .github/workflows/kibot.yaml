@@ -23,7 +23,10 @@ jobs:
         dir: output
         config: .github/kibot-fab.yaml
     - name: Generate QA HTML
-      run: python3 scripts/generate_qa_html.py documentation/QA.md -o output/QA.html
+      run: |
+        mkdir -p output
+        sudo chown -R "$(id -u):$(id -g)" output
+        python3 scripts/generate_qa_html.py documentation/QA.md -o output/QA.html
     - name: Full output
       uses: actions/upload-artifact@v7
       if: ${{ always() }}
