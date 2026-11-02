@@ -1,1673 +1,478 @@
 #!/usr/bin/env python3
-"""Generate a self-contained interactive QA.html page from documentation/QA.md.
+# Convert documentation/QA.md into a self-contained interactive QA.html page.
 
-This script enforces that `documentation/QA.md` remains pure Markdown (zero raw
-HTML tags or angle-bracket elements, and checkboxes only on Pass/Complete
-verification outcomes) and builds an interactive HTML form supporting:
-  - Interactive checkboxes exclusively on Pass / Complete outcomes
-  - Interactive text / date / textarea inputs for QA metadata and table readings
-  - Whole-page PDF export via window.print() and @media print styles
-  - Single-row CSV export (Download .csv and Copy to Clipboard) with an optional
-    column header row toggle for spreadsheet tracking
-"""
+import argparse, html, pathlib, re, subprocess, sys
 
-from __future__ import annotations
+TAG_RE = re.compile(r"<(?:/?[A-Za-z!][^>]*)>")
+HEAD_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+HR_RE = re.compile(r"^(?:[-*_]\s*){3,}$")
+LIST_RE = re.compile(r"^([ \t]*)([-*+]|\d+\.)\s+(.*)$")
+CHECK_RE = re.compile(r"^\[([ xX])\]\s+(.+?)\s*$")
+CELL_CHECK_RE = re.compile(r"^(.*?)\[([ xX])\]\s*(.*)$")
+META_RE = re.compile(r"^\*\*([^*]+?):\*\*\s*$")
+CH_RE = re.compile(r"\bCh(?:annel)?\s*(\d+)\b", re.I)
 
-import argparse
-import html
-import pathlib
-import re
-import subprocess
-import sys
-from dataclasses import dataclass, field
+FILLABLE_COLS = ("measured", "notes", "variance", "reading", "observed", "value", "comment")
+GENERIC_LABELS = {"notes", "notes / defects", "git revision / commit used", "comments"}
+HINTS = [
+    ("serial", "e.g., SN-1042"),
+    ("pcb revision", "e.g., Rev 1.0"),
+    ("performed by", "Inspector Name"),
+    ("commit", "e.g., a1b2c3d"),
+    ("git", "e.g., a1b2c3d"),
+    ("notes", "None / describe any observations..."),
+    ("deviations", "Record any deviations, waivers, or comments..."),
+]
 
-
-RAW_HTML_TAG_RE = re.compile(r"<(?:/?[A-Za-z!][^>]*)>")
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-HR_RE = re.compile(r"^(?:-\s*){3,}$|^(?:\*\s*){3,}$|^(?:_\s*){3,}$")
-LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>(?:[-*+])|(?:\d+\.))\s+(?P<rest>.*)$")
-CHECKBOX_ITEM_RE = re.compile(r"^\[(?P<state>[ xX])\]\s+(?P<label>.+?)\s*$")
-CELL_CHECKBOX_RE = re.compile(r"^(?P<prefix>.*?)\[(?P<state>[ xX])\]\s*(?P<suffix>.*)$")
-META_FIELD_RE = re.compile(r"^\*\*(?P<label>[^*]+?):\*\*\s*$")
-TABLE_ALIGN_CELL_RE = re.compile(r"^:?-{2,}:?$")
-CHANNEL_NUM_RE = re.compile(r"\bCh(?:annel)?\s*(\d+)\b", re.IGNORECASE)
-
-FILLABLE_COL_KEYWORDS = (
-    "measured",
-    "notes",
-    "variance",
-    "reading",
-    "observed",
-    "value",
-    "comment",
+KIBOT_QA_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="QA Procedure">'
+    '<rect x="38" y="28" width="180" height="208" rx="18" fill="#f8fafc" stroke="#0e4e8e" stroke-width="10"/>'
+    '<rect x="86" y="14" width="84" height="30" rx="10" fill="#0e4e8e"/><circle cx="128" cy="29" r="5" fill="#fff"/>'
+    '<rect x="66" y="76" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
+    '<path d="M72 90l7 7 12-14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<rect x="110" y="84" width="80" height="12" rx="6" fill="#0e4e8e"/>'
+    '<rect x="66" y="124" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
+    '<path d="M72 138l7 7 12-14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<rect x="110" y="132" width="80" height="12" rx="6" fill="#0e4e8e"/>'
+    '<rect x="66" y="172" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
+    '<path d="M72 186l7 7 12-14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<rect x="110" y="180" width="60" height="12" rx="6" fill="#0e4e8e"/></svg>'
 )
 
-GENERIC_META_LABELS = {
-    "notes",
-    "notes / defects",
-    "git revision / commit used",
-    "comments",
-}
-
-
-def strip_markdown_formatting(text: str) -> str:
-    """Return plain text with inline Markdown markers removed."""
-    cleaned = re.sub(r"`([^`]+)`", r"\1", text)
-    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
-    cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)
-    cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)
-    cleaned = re.sub(r"_([^_]+)_", r"\1", cleaned)
-    return " ".join(cleaned.split())
-
-
-def slugify(text: str) -> str:
-    """Create a URL-safe slug for heading and input IDs."""
-    plain = strip_markdown_formatting(text).lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", plain).strip("-")
-    return slug or "section"
-
-
-def render_inline(text: str) -> str:
-    """Render inline Markdown (code spans, links, bold, emphasis) safely to HTML."""
-    tokens: list[str] = []
-
-    def stash(fragment: str) -> str:
-        idx = len(tokens)
-        tokens.append(fragment)
-        return f"\x00TOK{idx}\x00"
-
-    # 1. Stash inline code spans first so inner characters are not parsed as Markdown
-    def replace_code(match: re.Match[str]) -> str:
-        return stash(f"<code>{html.escape(match.group(1))}</code>")
-
-    work = re.sub(r"`([^`]+)`", replace_code, text)
-
-    # 2. Escape remaining raw text
-    work = html.escape(work, quote=False)
-
-    # 3. Links: [label](url)
-    def replace_link(match: re.Match[str]) -> str:
-        label_html = match.group(1)
-        href = html.escape(html.unescape(match.group(2)).strip(), quote=True)
-        return stash(
-            f'<a href="{href}" target="_blank" rel="noopener noreferrer">{label_html}</a>'
-        )
-
-    work = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, work)
-
-    # 4. Bold and italic emphasis
-    work = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", work)
-    work = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", work)
-    work = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", work)
-
-    # 5. Restore stashed HTML fragments
-    for idx, fragment in enumerate(tokens):
-        work = work.replace(f"\x00TOK{idx}\x00", fragment)
-
-    return work
-
-
-def is_outcome_label(plain_text: str) -> bool:
-    """Return True iff text represents a Pass or Complete verification outcome."""
-    lowered = plain_text.lower()
-    return bool(re.search(r"\b(pass|complete)\b", lowered))
-
-
-def outcome_values_for_label(plain_text: str) -> tuple[str, str]:
-    """Return (checked_value, unchecked_value) matching the item label."""
-    lowered = plain_text.lower()
-    if re.search(r"\bcomplete\b", lowered) and not re.search(r"\bpass\b", lowered):
-        return ("Complete", "Incomplete")
-    return ("Pass", "Fail")
-
-
-def split_table_row(line: str) -> list[str]:
-    """Split a Markdown pipe-table row into stripped cell strings."""
-    stripped = line.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
-    cells = re.split(r"(?<!\\)\|", stripped)
-    return [c.replace(r"\|", "|").strip() for c in cells]
-
-
-def is_table_Separator(line: str) -> bool:
-    """Return True if line is a Markdown pipe-table alignment row."""
-    if "|" not in line:
-        return False
-    cells = split_table_row(line)
-    return bool(cells) and all(bool(TABLE_ALIGN_CELL_RE.match(c)) for c in cells)
-
-
-def validate_markdown(md_text: str, source_name: str = "QA.md") -> None:
-    """Validate that QA.md contains zero raw HTML tags and only outcome checkboxes."""
-    in_fence = False
-    errors: list[str] = []
-
-    for lineno, raw_line in enumerate(md_text.splitlines(), start=1):
-        stripped = raw_line.strip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-
-        # 1. Check for raw HTML tags or comments
-        tag_match = RAW_HTML_TAG_RE.search(raw_line)
-        if tag_match:
-            errors.append(
-                f"{source_name}:{lineno}: Raw HTML / angle-bracket element found: {tag_match.group(0)!r}"
-            )
-
-        # 2. Check list checkboxes
-        list_match = LIST_ITEM_RE.match(raw_line)
-        if list_match:
-            cb_match = CHECKBOX_ITEM_RE.match(list_match.group("rest"))
-            if cb_match:
-                plain = strip_markdown_formatting(cb_match.group("label"))
-                if not is_outcome_label(plain):
-                    errors.append(
-                        f"{source_name}:{lineno}: Checkbox on non-Pass/Complete procedural item: {plain!r}"
-                    )
-            continue
-
-        # 3. Check table cell checkboxes
-        if "|" in raw_line and not is_table_Separator(raw_line):
-            for cell in split_table_row(raw_line):
-                cell_cb = CELL_CHECKBOX_RE.match(cell)
-                if cell_cb:
-                    combined = strip_markdown_formatting(
-                        f"{cell_cb.group('prefix')} {cell_cb.group('suffix')}"
-                    )
-                    if not is_outcome_label(combined):
-                        errors.append(
-                            f"{source_name}:{lineno}: Table checkbox on non-Pass/Complete cell: {cell!r}"
-                        )
-
-    if errors:
-        raise ValueError("Markdown validation failed:\n  - " + "\n  - ".join(errors))
-
-
-@dataclass
-class BuildContext:
-    """Tracks generated control IDs, section headings, and export ordering."""
-
-    current_h2: str = ""
-    current_h3: str = ""
-    control_Seq: int = 0
-    csv_order_seq: int = 0
-    used_ids: set[str] = field(default_factory=set)
-    metadata_headers: list[str] = field(default_factory=list)
-    checkbox_headers: list[str] = field(default_factory=list)
-
-    def next_id(self, prefix: str, label: str) -> str:
-        self.control_Seq += 1
-        base = f"{prefix}-{slugify(label)}"
-        candidate = base
-        if candidate in self.used_ids:
-            candidate = f"{base}-{self.control_Seq}"
-        self.used_ids.add(candidate)
-        return candidate
-
-    def next_csv_order(self) -> int:
-        self.csv_order_seq += 1
-        return self.csv_order_seq * 100
-
-
-def placeholder_for_metadata(label: str) -> str:
-    """Return a concise placeholder hint for a metadata input field."""
-    lower = label.lower()
-    if "serial" in lower:
-        return "e.g., SN-1042"
-    if "pcb revision" in lower or lower == "revision":
-        return "e.g., Rev 1.0"
-    if "performed by" in lower or "tester" in lower or "inspector" in lower:
-        return "Inspector Name"
-    if "commit" in lower or "git revision" in lower:
-        return "e.g., a1b2c3d"
-    if "notes" in lower or "defects" in lower:
-        return "None / describe any observations..."
-    if "deviations" in lower or "waivers" in lower or "comments" in lower:
-        return "Record any deviations, waivers, or comments..."
-    return ""
-
-
-def build_metadata_item_html(label: str, ctx: BuildContext) -> str:
-    """Render a metadata list item as an interactive text, date, or textarea field."""
-    clean_label = strip_markdown_formatting(label).rstrip(":").strip()
-    csv_header = clean_label
-    if (
-        clean_label.lower() in GENERIC_META_LABELS
-        and ctx.current_h3
-        and ctx.current_h3.lower() not in {"qa metadata", "final result"}
-    ):
-        csv_header = f"{ctx.current_h3} - {clean_label}"
-
-    input_id = ctx.next_id("meta", csv_header)
-    csv_order = ctx.next_csv_order()
-    ctx.metadata_headers.append(csv_header)
-
-    esc_header = html.escape(csv_header, quote=True)
-    esc_label = html.escape(clean_label)
-    placeholder = html.escape(placeholder_for_metadata(clean_label), quote=True)
-    lower = clean_label.lower()
-
-    if "date" in lower:
-        control_html = (
-            f'<input type="date" id="{input_id}" class="qa-input qa-date-input" '
-            f'data-csv-role="metadata" data-csv-header="{esc_header}" '
-            f'data-csv-order="{csv_order}">'
-        )
-        return (
-            f'<li class="qa-meta-item">'
-            f'<label class="qa-meta-label" for="{input_id}"><strong>{esc_label}:</strong></label>'
-            f"{control_html}</li>"
-        )
-
-    if any(k in lower for k in ("deviations", "waivers", "comments")):
-        control_html = (
-            f'<textarea id="{input_id}" class="qa-input qa-textarea" rows="3" '
-            f'placeholder="{placeholder}" data-csv-role="metadata" '
-            f'data-csv-header="{esc_header}" data-csv-order="{csv_order}"></textarea>'
-        )
-        return (
-            f'<li class="qa-meta-item qa-meta-block">'
-            f'<label class="qa-meta-label" for="{input_id}"><strong>{esc_label}:</strong></label>'
-            f"{control_html}</li>"
-        )
-
-    wide_cls = " qa-input-wide" if ("notes" in lower or "defects" in lower) else ""
-    control_html = (
-        f'<input type="text" id="{input_id}" class="qa-input{wide_cls}" '
-        f'placeholder="{placeholder}" data-csv-role="metadata" '
-        f'data-csv-header="{esc_header}" data-csv-order="{csv_order}">'
-    )
-    return (
-        f'<li class="qa-meta-item">'
-        f'<label class="qa-meta-label" for="{input_id}"><strong>{esc_label}:</strong></label>'
-        f"{control_html}</li>"
-    )
-
-
-def build_checkbox_item_html(
-    state_char: str, label_md: str, ctx: BuildContext
-) -> str:
-    """Render a Pass/Complete task list item as an interactive HTML checkbox."""
-    plain_label = strip_markdown_formatting(label_md)
-    checked_val, unchecked_val = outcome_values_for_label(plain_label)
-    input_id = ctx.next_id("chk", plain_label)
-    csv_order = ctx.next_csv_order()
-    ctx.checkbox_headers.append((csv_order, plain_label))
-
-    checked_attr = " checked" if state_char.lower() == "x" else ""
-    esc_header = html.escape(plain_label, quote=True)
-    rendered_label = render_inline(label_md)
-
-    return (
-        f'<li class="qa-check-item">'
-        f'<label class="qa-check-label" for="{input_id}">'
-        f'<input type="checkbox" id="{input_id}" class="qa-checkbox"{checked_attr} '
-        f'data-csv-role="checkbox" data-csv-header="{esc_header}" '
-        f'data-checked-value="{checked_val}" data-unchecked-value="{unchecked_val}" '
-        f'data-csv-order="{csv_order}">'
-        f'<span class="qa-check-text">{rendered_label}</span>'
-        f"</label></li>"
-    )
-
-
-def indent_width(indent_str: str) -> int:
-    """Compute column width of leading indentation."""
-    return len(indent_str.expandtabs(4))
-
-
-def parse_list_block(
-    lines: list[str], start_idx: int, ctx: BuildContext
-) -> tuple[str, int]:
-    """Parse a contiguous (possibly nested) Markdown list block into HTML."""
-    parsed_items: list[tuple[int, str, str]] = []
-    idx = start_idx
-    while idx < len(lines):
-        line = lines[idx]
-        if not line.strip():
-            # Look ahead: if next non-empty line is deeply indented continuation, stop if top-level break
-            break
-        m = LIST_ITEM_RE.match(line)
-        if not m:
-            break
-        ind = indent_width(m.group("indent"))
-        marker = m.group("marker")
-        list_type = "ol" if marker.endswith(".") else "ul"
-        parsed_items.append((ind, list_type, m.group("rest")))
-        idx += 1
-
-    def classify_item_kind(rest: str) -> str:
-        if CHECKBOX_ITEM_RE.match(rest):
-            return "checkbox"
-        if META_FIELD_RE.match(rest):
-            return "meta"
-        return "step"
-
-    def render_level(pos: int, min_indent: int) -> tuple[str, int]:
-        if pos >= len(parsed_items):
-            return ("", pos)
-
-        base_indent, list_type, first_rest = parsed_items[pos]
-        first_kind = classify_item_kind(first_rest)
-        list_classes: list[str] = []
-        if first_kind == "checkbox":
-            list_classes.append("qa-outcome-list")
-        elif first_kind == "meta":
-            list_classes.append("qa-meta-list")
-        else:
-            list_classes.append("qa-step-list")
-
-        cls_attr = f' class="{" ".join(list_classes)}"' if list_classes else ""
-        out: list[str] = [f"<{list_type}{cls_attr}>"]
-
-        while pos < len(parsed_items):
-            cur_indent, cur_type, cur_rest = parsed_items[pos]
-            if cur_indent < base_indent:
-                break
-            cur_kind = classify_item_kind(cur_rest)
-            # Split into a separate sibling list if list type (ul/ol) or semantic kind changes at same indent
-            if cur_indent == base_indent and (
-                cur_type != list_type or cur_kind != first_kind
-            ):
-                break
-
-            if cur_indent > base_indent:
-                nested_html, pos = render_level(pos, cur_indent)
-                if out and out[-1].endswith("</li>"):
-                    out[-1] = out[-1][:-5] + nested_html + "</li>"
-                else:
-                    out.append(nested_html)
-                continue
-
-            # Render item at base_indent
-            cb_match = CHECKBOX_ITEM_RE.match(cur_rest)
-            meta_match = META_FIELD_RE.match(cur_rest)
-            if cb_match:
-                li_html = build_checkbox_item_html(
-                    cb_match.group("state"), cb_match.group("label"), ctx
-                )
-            elif meta_match:
-                li_html = build_metadata_item_html(meta_match.group("label"), ctx)
-            else:
-                li_html = f"<li>{render_inline(cur_rest)}</li>"
-
-            pos += 1
-            if pos < len(parsed_items) and parsed_items[pos][0] > base_indent:
-                nested_html, pos = render_level(pos, parsed_items[pos][0])
-                li_html = li_html[:-5] + nested_html + "</li>"
-
-            out.append(li_html)
-
-        out.append(f"</{list_type}>")
-        return ("\n".join(out), pos)
-
-    pos = 0
-    blocks: list[str] = []
-    while pos < len(parsed_items):
-        block_html, pos = render_level(pos, parsed_items[pos][0])
-        blocks.append(block_html)
-
-    return ("\n".join(blocks), idx)
-
-
-def parse_table_block(
-    lines: list[str], start_idx: int, ctx: BuildContext
-) -> tuple[str, int]:
-    """Parse a Markdown pipe table and inject interactive checkboxes and inputs."""
-    header_cells = split_table_row(lines[start_idx])
-    align_cells = split_table_row(lines[start_idx + 1])
-
-    alignments: list[str] = []
-    for ac in align_cells:
-        if ac.startswith(":") and ac.endswith(":"):
-            alignments.append("center")
-        elif ac.endswith(":"):
-            alignments.append("right")
-        elif ac.startswith(":"):
-            alignments.append("left")
-        else:
-            alignments.append("")
-
-    idx = start_idx + 2
-    body_rows: list[list[str]] = []
-    while idx < len(lines):
-        line = lines[idx]
-        if not line.strip() or "|" not in line:
-            break
-        body_rows.append(split_table_row(line))
-        idx += 1
-
-    # Detect whether this table is a numbered channel matrix (e.g., Ch 0 .. Ch 15)
-    table_base_order = ctx.next_csv_order()
-    has_channel_numbers = any(
-        CHANNEL_NUM_RE.search(cell)
-        for row in body_rows
-        for cell in row
-        if CELL_CHECKBOX_RE.match(cell)
-    )
-    if has_channel_numbers:
-        # Reserve enough ordering slots for all channels in this table
-        ctx.csv_order_seq += len(body_rows) * max(1, len(header_cells))
-
-    out: list[str] = ['<div class="qa-table-wrap"><table class="qa-table">']
-    out.append("<thead><tr>")
-    for col_i, h_text in enumerate(header_cells):
-        align = alignments[col_i] if col_i < len(alignments) else ""
-        style_attr = f' style="text-align: {align};"' if align else ""
-        out.append(f"<th{style_attr}>{render_inline(h_text)}</th>")
-    out.append("</tr></thead>")
-
-    out.append("<tbody>")
-    for row in body_rows:
-        out.append("<tr>")
-        row_key = strip_markdown_formatting(row[0]) if row else ""
-        for col_i in range(len(header_cells)):
-            cell_raw = row[col_i] if col_i < len(row) else ""
-            col_header = strip_markdown_formatting(header_cells[col_i])
-            align = alignments[col_i] if col_i < len(alignments) else ""
-            style_attr = f' style="text-align: {align};"' if align else ""
-
-            cell_cb = CELL_CHECKBOX_RE.match(cell_raw)
-            if cell_cb:
-                prefix_raw = cell_cb.group("prefix").strip()
-                suffix_raw = cell_cb.group("suffix").strip()
-                state_char = cell_cb.group("state")
-
-                prefix_plain = strip_markdown_formatting(prefix_raw).rstrip(":").strip()
-                suffix_plain = strip_markdown_formatting(suffix_raw).strip()
-                combined_plain = " ".join(p for p in (prefix_plain, suffix_plain) if p)
-
-                # Include row identifier in CSV header when checkbox is in a status column
-                if not prefix_plain and row_key and col_i > 0:
-                    csv_header = f"{row_key} {suffix_plain}".strip()
-                else:
-                    csv_header = combined_plain
-
-                ch_match = CHANNEL_NUM_RE.search(csv_header)
-                if has_channel_numbers and ch_match:
-                    csv_order = table_base_order + int(ch_match.group(1))
-                else:
-                    csv_order = ctx.next_csv_order()
-
-                checked_val, unchecked_val = outcome_values_for_label(csv_header)
-                ctx.checkbox_headers.append((csv_order, csv_header))
-                input_id = ctx.next_id("chk", csv_header)
-                checked_attr = " checked" if state_char.lower() == "x" else ""
-                esc_header = html.escape(csv_header, quote=True)
-
-                prefix_html = (
-                    f'<span class="qa-cell-prefix">{render_inline(prefix_raw)}</span> '
-                    if prefix_raw
-                    else ""
-                )
-                suffix_html = (
-                    f'<span class="qa-check-text">{render_inline(suffix_raw)}</span>'
-                    if suffix_raw
-                    else ""
-                )
-                cell_html = (
-                    f'<label class="qa-check-label qa-table-check" for="{input_id}">'
-                    f"{prefix_html}"
-                    f'<input type="checkbox" id="{input_id}" class="qa-checkbox"{checked_attr} '
-                    f'data-csv-role="checkbox" data-csv-header="{esc_header}" '
-                    f'data-checked-value="{checked_val}" data-unchecked-value="{unchecked_val}" '
-                    f'data-csv-order="{csv_order}">'
-                    f"{suffix_html}</label>"
-                )
-                out.append(f"<td{style_attr}>{cell_html}</td>")
-            elif not cell_raw and any(
-                kw in col_header.lower() for kw in FILLABLE_COL_KEYWORDS
-            ):
-                sec_prefix = f"{ctx.current_h3} " if ctx.current_h3 else ""
-                aria_lbl = html.escape(
-                    f"{sec_prefix}{row_key} {col_header}".strip(), quote=True
-                )
-                input_id = ctx.next_id("tbl", f"{sec_prefix}{row_key}-{col_header}")
-                placeholder = (
-                    "Enter value..."
-                    if "measured" in col_header.lower()
-                    else "Optional notes..."
-                )
-                cell_html = (
-                    f'<input type="text" id="{input_id}" class="qa-input qa-table-input" '
-                    f'aria-label="{aria_lbl}" placeholder="{placeholder}">'
-                )
-                out.append(f"<td{style_attr}>{cell_html}</td>")
-            else:
-                out.append(f"<td{style_attr}>{render_inline(cell_raw)}</td>")
-        out.append("</tr>")
-    out.append("</tbody></table></div>")
-    return ("\n".join(out), idx)
-
-
-def convert_markdown_body(md_text: str) -> tuple[str, str, BuildContext]:
-    """Convert validated Markdown into HTML body content and return (title, html, ctx)."""
-    lines = md_text.splitlines()
-    ctx = BuildContext()
-    blocks: list[str] = []
-    doc_title = "Quality Assurance Procedure"
-
-    idx = 0
-    in_fence = False
-    fence_lines: list[str] = []
-
-    while idx < len(lines):
-        line = lines[idx]
-        stripped = line.strip()
-
-        # Fenced code blocks
-        if stripped.startswith("```"):
-            if in_fence:
-                blocks.append(
-                    f"<pre><code>{html.escape(chr(10).join(fence_lines))}</code></pre>"
-                )
-                fence_lines = []
-                in_fence = False
-            else:
-                in_fence = True
-            idx += 1
-            continue
-
-        if in_fence:
-            fence_lines.append(line)
-            idx += 1
-            continue
-
-        # Blank line
-        if not stripped:
-            idx += 1
-            continue
-
-        # Horizontal rule
-        if HR_RE.match(stripped):
-            if getattr(ctx, "in_section", False):
-                blocks.append("</section>")
-                ctx.in_section = False
-            blocks.append("<hr>")
-            idx += 1
-            continue
-
-        # Heading
-        h_match = HEADING_RE.match(line)
-        if h_match:
-            level = len(h_match.group(1))
-            raw_heading = h_match.group(2)
-            plain_heading = strip_markdown_formatting(raw_heading)
-            if level == 1 and doc_title == "Quality Assurance Procedure":
-                doc_title = plain_heading
-            elif level == 2:
-                ctx.current_h2 = plain_heading
-                ctx.current_h3 = ""
-            elif level == 3:
-                ctx.current_h3 = plain_heading
-
-            if level in (2, 3) and getattr(ctx, "in_section", False):
-                blocks.append("</section>")
-                ctx.in_section = False
-
-            h_id = ctx.next_id("sec", plain_heading)
-            if level in (2, 3):
-                blocks.append('<section class="qa-section">')
-                ctx.in_section = True
-            blocks.append(
-                f'<h{level} id="{h_id}">{render_inline(raw_heading)}</h{level}>'
-            )
-            idx += 1
-            continue
-
-        # Pipe table
-        if (
-            "|" in line
-            and idx + 1 < len(lines)
-            and is_table_Separator(lines[idx + 1])
-        ):
-            table_html, idx = parse_table_block(lines, idx, ctx)
-            blocks.append(table_html)
-            continue
-
-        # List block
-        if LIST_ITEM_RE.match(line):
-            list_html, idx = parse_list_block(lines, idx, ctx)
-            blocks.append(list_html)
-            continue
-
-        # Paragraph
-        para_lines: list[str] = []
-        while idx < len(lines):
-            cur = lines[idx]
-            cur_stripped = cur.strip()
-            if (
-                not cur_stripped
-                or cur_stripped.startswith("```")
-                or HR_RE.match(cur_stripped)
-                or HEADING_RE.match(cur)
-                or LIST_ITEM_RE.match(cur)
-                or (
-                    "|" in cur
-                    and idx + 1 < len(lines)
-                    and is_table_Separator(lines[idx + 1])
-                )
-            ):
-                break
-            para_lines.append(cur_stripped)
-            idx += 1
-
-        blocks.append(f"<p>{render_inline(' '.join(para_lines))}</p>")
-
-    if getattr(ctx, "in_section", False):
-        blocks.append("</section>")
-        ctx.in_section = False
-
-    return doc_title, "\n".join(blocks), ctx
-
-
-def detect_git_revision(repo_dir: pathlib.Path) -> str:
-    """Return short git SHA of HEAD if available, else empty string."""
-    try:
-        res = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-        return res.stdout.strip()
-    except Exception:
-        return ""
-
-
-TOOLBAR_HTML = """\
-<div class="qa-toolbar no-print" role="region" aria-label="QA Export Actions ({position})">
+TOOLBAR_HTML = """<div class="qa-toolbar no-print" role="region" aria-label="QA Export Actions ({pos})">
   <div class="qa-toolbar-actions">
-    <button type="button" class="qa-btn qa-btn-primary" onclick="exportPdf()">
-      Export PDF
-    </button>
-    <button type="button" class="qa-btn qa-btn-accent" onclick="downloadCsvRow(this)">
-      Download CSV Row
-    </button>
-    <button type="button" class="qa-btn qa-btn-secondary" onclick="copyCsvRow(this)">
-      Copy CSV Row
-    </button>
-    <label class="qa-toggle-label" title="Prepend the column header row above the exported data row">
-      <input type="checkbox" class="include-headers-toggle" onchange="syncHeaderToggles(this)">
-      <span>Include column headers</span>
-    </label>
-    <button type="button" class="qa-btn qa-btn-danger" onclick="clearQaForm()">
-      Clear Form
-    </button>
+    <button type="button" class="qa-btn qa-btn-primary" onclick="exportPdf()">Export PDF</button>
+    <button type="button" class="qa-btn qa-btn-accent" onclick="downloadCsvRow(this)">Download CSV Row</button>
+    <button type="button" class="qa-btn qa-btn-secondary" onclick="copyCsvRow(this)">Copy CSV Row</button>
+    <label class="qa-toggle-label"><input type="checkbox" class="include-headers-toggle" onchange="syncHeaderToggles(this)"><span>Include column headers</span></label>
+    <button type="button" class="qa-btn qa-btn-danger" onclick="clearQaForm()">Clear Form</button>
   </div>
   <div class="qa-toolbar-meta">
-    <span class="qa-progress-badge" aria-live="polite">{initial_checked} / {total_checks} checks verified</span>
+    <span class="qa-progress-badge" aria-live="polite">{checked} / {total} checks verified</span>
     <span class="qa-status-msg" role="status" aria-live="polite"></span>
   </div>
 </div>"""
 
-
-PAGE_CSS = """\
-:root {
-  --bg-page: #f5f7fa;
-  --bg-card: #ffffff;
-  --text-main: #1f2937;
-  --text-muted: #4b5563;
-  --border-color: #d1d5db;
-  --border-subtle: #e5e7eb;
-  --primary: #0f4c81;
-  --primary-hover: #0b3961;
-  --accent: #047857;
-  --accent-hover: #065f46;
-  --secondary: #2563eb;
-  --secondary-hover: #1d4ed8;
-  --danger-bg: #fff1f2;
-  --danger-text: #be123c;
-  --danger-border: #fecdd3;
-  --check-bg: #f0fdf4;
-  --check-border: #bbf7d0;
-}
-
-*, *::before, *::after {
-  box-sizing: border-box;
-}
-
-html {
-  font-size: 16px;
-  color: var(--text-main);
-  background-color: var(--bg-page);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  line-height: 1.55;
-}
-
-body {
-  margin: 0;
-  padding: 24px 16px 48px;
-}
-
-.qa-container {
-  max-width: 920px;
-  margin: 0 auto;
-  background: var(--bg-card);
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  padding: 32px 40px;
-  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
-}
-
-.qa-doc-meta {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px 16px;
-  font-size: 0.85rem;
-  color: var(--text-muted);
-  margin-top: -8px;
-  margin-bottom: 18px;
-}
-
-.qa-back-link {
-  font-weight: 600;
-  color: var(--primary);
-  text-decoration: none;
-}
-
-.qa-back-link:hover {
-  text-decoration: underline;
-}
-
-h1, h2, h3, h4, h5, h6 {
-  color: #111827;
-  line-height: 1.25;
-  margin-top: 1.4em;
-  margin-bottom: 0.55em;
-}
-
-h1 {
-  margin-top: 0;
-  font-size: 1.85rem;
-  border-bottom: 2px solid var(--primary);
-  padding-bottom: 0.4em;
-}
-
-h2 {
-  font-size: 1.35rem;
-  border-bottom: 1px solid var(--border-subtle);
-  padding-bottom: 0.25em;
-}
-
-h3 {
-  font-size: 1.12rem;
-  color: var(--primary);
-}
-
-p {
-  margin: 0.65em 0;
-}
-
-a {
-  color: var(--secondary);
-  text-decoration: underline;
-}
-
-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 0.9em;
-  background: #f3f4f6;
-  padding: 0.15em 0.38em;
-  border-radius: 4px;
-}
-
-hr {
-  border: none;
-  border-top: 1px solid var(--border-subtle);
-  margin: 1.6em 0;
-}
-
-/* Lists */
-ul, ol {
-  margin: 0.6em 0;
-  padding-left: 1.5em;
-}
-
-.qa-step-list li {
-  margin: 0.35em 0;
-}
-
-.qa-meta-list,
-.qa-outcome-list {
-  list-style: none;
-  padding-left: 0;
-}
-
-.qa-meta-item {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin: 0.55em 0;
-}
-
-.qa-meta-item.qa-meta-block {
-  flex-direction: column;
-  align-items: stretch;
-}
-
-.qa-meta-label {
-  min-width: 220px;
-  color: var(--text-main);
-}
-
-/* Inputs */
-.qa-input {
-  font: inherit;
-  font-size: 0.95rem;
-  color: var(--text-main);
-  background: #ffffff;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 6px 10px;
-  min-width: 240px;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.qa-input:focus {
-  outline: none;
-  border-color: var(--secondary);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
-}
-
-.qa-input-wide {
-  flex: 1 1 360px;
-}
-
-.qa-textarea {
-  width: 100%;
-  min-height: 76px;
-  resize: vertical;
-}
-
-.qa-table-input {
-  width: 100%;
-  min-width: 110px;
-  padding: 5px 8px;
-}
-
-/* Outcome Checkboxes */
-.qa-check-item {
-  margin: 0.75em 0;
-}
-
-.qa-check-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-  padding: 8px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: #f9fafb;
-  user-select: none;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
-}
-
-.qa-check-label:hover {
-  background: #f3f4f6;
-}
-
-.qa-check-label:has(.qa-checkbox:checked) {
-  background: var(--check-bg);
-  border-color: var(--check-border);
-}
-
-.qa-table-check {
-  padding: 4px 10px;
-  background: transparent;
-  border-color: transparent;
-}
-
-.qa-table-check:hover {
-  background: #f3f4f6;
-}
-
-.qa-checkbox {
-  width: 1.15rem;
-  height: 1.15rem;
-  margin: 0;
-  accent-color: var(--accent);
-  cursor: pointer;
-  flex-shrink: 0;
-  -webkit-print-color-adjust: exact;
-  print-color-adjust: exact;
-}
-
-/* Tables */
-.qa-table-wrap {
-  overflow-x: auto;
-  margin: 0.9em 0;
-}
-
-.qa-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.95rem;
-}
-
-.qa-table th,
-.qa-table td {
-  border: 1px solid var(--border-color);
-  padding: 8px 12px;
-  text-align: left;
-  vertical-align: middle;
-}
-
-.qa-table thead th {
-  background: #f3f4f6;
-  font-weight: 600;
-  color: #111827;
-}
-
-.qa-table tbody tr:nth-child(even) {
-  background: #fafafa;
-}
-
-/* Action Toolbars */
-.qa-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px 16px;
-  background: #f8fafc;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 12px 16px;
-  margin: 18px 0;
-}
-
-.qa-toolbar-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-}
-
-.qa-toolbar-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  font-size: 0.9rem;
-}
-
-.qa-btn {
-  font: inherit;
-  font-size: 0.9rem;
-  font-weight: 600;
-  padding: 8px 14px;
-  border-radius: 6px;
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
-}
-
-.qa-btn-primary {
-  background: var(--primary);
-  color: #ffffff;
-}
-
-.qa-btn-primary:hover {
-  background: var(--primary-hover);
-}
-
-.qa-btn-accent {
-  background: var(--accent);
-  color: #ffffff;
-}
-
-.qa-btn-accent:hover {
-  background: var(--accent-hover);
-}
-
-.qa-btn-secondary {
-  background: var(--secondary);
-  color: #ffffff;
-}
-
-.qa-btn-secondary:hover {
-  background: var(--secondary-hover);
-}
-
-.qa-btn-danger {
-  background: var(--danger-bg);
-  color: var(--danger-text);
-  border-color: var(--danger-border);
-}
-
-.qa-btn-danger:hover {
-  background: #ffe4e6;
-}
-
-.qa-toggle-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.9rem;
-  color: var(--text-main);
-  cursor: pointer;
-  padding: 4px 8px;
-  user-select: none;
-}
-
-.qa-toggle-label input[type="checkbox"] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: var(--secondary);
-  cursor: pointer;
-}
-
-.qa-progress-badge {
-  background: #e0f2fe;
-  color: #075985;
-  font-weight: 600;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-size: 0.85rem;
-}
-
-.qa-status-msg {
-  font-weight: 600;
-  color: var(--accent);
-}
-
-@media (max-width: 640px) {
-  body {
-    padding: 10px;
-  }
-  .qa-container {
-    padding: 18px 16px;
-  }
-  .qa-meta-label {
-    min-width: 100%;
-  }
-  .qa-input {
-    width: 100%;
-    min-width: 0;
-  }
-}
-
-/* Dedicated Print / PDF Styles */
-@page {
-  margin: 0.55in;
-}
-
+PAGE_CSS = """
+:root { --primary: #0f4c81; --accent: #047857; --secondary: #2563eb; --border: #d1d5db; }
+*, *::before, *::after { box-sizing: border-box; }
+html { font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; color: #1f2937; background: #f5f7fa; }
+body { margin: 0; padding: 24px 16px 48px; }
+.qa-container { max-width: 920px; margin: 0 auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 32px 40px; box-shadow: 0 2px 10px rgba(15,23,42,.05); }
+.qa-doc-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 16px; font-size: .85rem; color: #4b5563; margin: -8px 0 18px; }
+.qa-back-link { font-weight: 600; color: var(--primary); text-decoration: none; }
+h1, h2, h3 { color: #111827; line-height: 1.25; margin: 1.4em 0 .55em; }
+h1 { margin-top: 0; font-size: 1.85rem; border-bottom: 2px solid var(--primary); padding-bottom: .4em; }
+h2 { font-size: 1.35rem; border-bottom: 1px solid #e5e7eb; padding-bottom: .25em; }
+h3 { font-size: 1.12rem; color: var(--primary); }
+p { margin: .65em 0; }
+a { color: var(--secondary); }
+code { font: .9em ui-monospace, Menlo, Consolas, monospace; background: #f3f4f6; padding: .15em .38em; border-radius: 4px; }
+hr { border: 0; border-top: 1px solid #e5e7eb; margin: 1.6em 0; }
+ul, ol { margin: .6em 0; padding-left: 1.5em; }
+.qa-step-list li { margin: .35em 0; }
+.qa-meta-list, .qa-outcome-list { list-style: none; padding-left: 0; }
+.qa-meta-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: .55em 0; }
+.qa-meta-item.qa-meta-block { flex-direction: column; align-items: stretch; }
+.qa-meta-label { min-width: 220px; }
+.qa-input { font: inherit; font-size: .95rem; color: #1f2937; background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; min-width: 240px; }
+.qa-input-wide { flex: 1 1 360px; }
+.qa-textarea { width: 100%; min-height: 76px; resize: vertical; }
+.qa-table-input { width: 100%; min-width: 110px; padding: 5px 8px; }
+.qa-check-item { margin: .75em 0; }
+.qa-check-label { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border); background: #f9fafb; user-select: none; }
+.qa-check-label:has(.qa-checkbox:checked) { background: #f0fdf4; border-color: #bbf7d0; }
+.qa-table-check { padding: 4px 10px; background: transparent; border-color: transparent; }
+.qa-checkbox { width: 1.15rem; height: 1.15rem; margin: 0; accent-color: var(--accent); cursor: pointer; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+.qa-table-wrap { overflow-x: auto; margin: .9em 0; }
+.qa-table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+.qa-table th, .qa-table td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: middle; }
+.qa-table thead th { background: #f3f4f6; font-weight: 600; }
+.qa-table tbody tr:nth-child(even) { background: #fafafa; }
+.qa-toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 16px; background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin: 18px 0; }
+.qa-toolbar-actions, .qa-toolbar-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.qa-btn { font: 600 .9rem inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid transparent; cursor: pointer; color: #fff; }
+.qa-btn-primary { background: var(--primary); }
+.qa-btn-accent { background: var(--accent); }
+.qa-btn-secondary { background: var(--secondary); }
+.qa-btn-danger { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
+.qa-toggle-label { display: inline-flex; align-items: center; gap: 6px; font-size: .9rem; cursor: pointer; user-select: none; }
+.qa-progress-badge { background: #e0f2fe; color: #075985; font-weight: 600; padding: 4px 10px; border-radius: 999px; font-size: .85rem; }
+.qa-status-msg { font-weight: 600; color: var(--accent); font-size: .9rem; }
+@media (max-width: 640px) { body { padding: 10px; } .qa-container { padding: 18px 16px; } .qa-meta-label, .qa-input { width: 100%; min-width: 0; } }
+@page { margin: 0.55in; }
 @media print {
-  .no-print {
-    display: none !important;
-  }
-
-  html, body {
-    background: #ffffff !important;
-    color: #000000 !important;
-    padding: 0 !important;
-    margin: 0 !important;
-    font-size: 10.5pt;
-    line-height: 1.35;
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
-
-  .qa-container {
-    max-width: 100% !important;
-    border: none !important;
-    box-shadow: none !important;
-    padding: 0 !important;
-    margin: 0 !important;
-  }
-
-  h1, h2, h3, h4 {
-    break-after: avoid;
-    page-break-after: avoid;
-    color: #000000 !important;
-  }
-
-  p, li {
-    orphans: 3;
-    widows: 3;
-  }
-
-  .qa-section,
-  .qa-table-wrap,
-  .qa-table,
-  .qa-check-item,
-  .qa-meta-item {
-    break-inside: avoid;
-    page-break-inside: avoid;
-  }
-
-  .qa-table tr {
-    break-inside: avoid;
-    page-break-inside: avoid;
-  }
-
-  .qa-table th,
-  .qa-table td {
-    border: 1px solid #333333 !important;
-    padding: 5px 8px !important;
-  }
-
-  .qa-table thead th {
-    background: #eaeaea !important;
-  }
-
-  .qa-input {
-    border: none !important;
-    border-bottom: 1px solid #222222 !important;
-    border-radius: 0 !important;
-    background: transparent !important;
-    padding: 2px 4px !important;
-    color: #000000 !important;
-  }
-
-  .qa-table-input {
-    border-bottom: none !important;
-    padding: 0 2px !important;
-  }
-
-  .qa-input::placeholder {
-    color: transparent !important;
-  }
-
-  .qa-textarea {
-    border: 1px solid #444444 !important;
-    border-radius: 4px !important;
-    padding: 6px !important;
-    height: auto !important;
-    overflow: visible !important;
-    white-space: pre-wrap !important;
-  }
-
-  .qa-check-label {
-    border: 1px solid #555555 !important;
-    padding: 4px 8px !important;
-  }
-
-  .qa-table-check {
-    border: none !important;
-    padding: 0 !important;
-  }
-
-  .qa-checkbox {
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
-
-  a {
-    color: #000000 !important;
-    text-decoration: none !important;
-  }
+  .no-print { display: none !important; }
+  html, body { background: #fff !important; color: #000 !important; padding: 0 !important; margin: 0 !important; font-size: 10.5pt; line-height: 1.35; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .qa-container { max-width: 100% !important; border: 0 !important; box-shadow: none !important; padding: 0 !important; }
+  h1, h2, h3, h4 { break-after: avoid; color: #000 !important; }
+  .qa-section, .qa-table-wrap, .qa-table, .qa-table tr, .qa-check-item, .qa-meta-item { break-inside: avoid; }
+  .qa-table th, .qa-table td { border: 1px solid #333 !important; padding: 5px 8px !important; }
+  .qa-table thead th { background: #eaeaea !important; }
+  .qa-input { border: 0 !important; border-bottom: 1px solid #222 !important; border-radius: 0 !important; background: transparent !important; padding: 2px 4px !important; color: #000 !important; }
+  .qa-table-input { border-bottom: 0 !important; padding: 0 2px !important; }
+  .qa-textarea { border: 1px solid #444 !important; border-radius: 4px !important; padding: 6px !important; height: auto !important; overflow: visible !important; white-space: pre-wrap !important; }
+  .qa-check-label { border: 1px solid #555 !important; padding: 4px 8px !important; }
+  .qa-table-check { border: 0 !important; padding: 0 !important; }
+  a { color: #000 !important; text-decoration: none !important; }
 }
 """
 
-
-PAGE_JS = """\
+PAGE_JS = """
 (function () {
-  "use strict";
+  const byOrder = r => [...document.querySelectorAll('[data-csv-role="' + r + '"]')].sort((a, b) => (+a.dataset.csvOrder || 0) - (+b.dataset.csvOrder || 0));
+  const csvCell = v => { const s = String(v ?? "").replace(/\\r\\n|\\r|\\n/g, " ").trim(); return /[",\\r\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
 
-  function getSortedControls(role) {
-    const nodes = Array.from(
-      document.querySelectorAll('[data-csv-role="' + role + '"]')
-    );
-    nodes.sort(function (a, b) {
-      const ordA = parseInt(a.getAttribute("data-csv-order") || "0", 10);
-      const ordB = parseInt(b.getAttribute("data-csv-order") || "0", 10);
-      return ordA - ordB;
-    });
-    return nodes;
-  }
-
-  function escapeCsvCell(value) {
-    if (value === null || value === undefined) {
-      return "";
-    }
-    const normalized = String(value).replace(/\\r\\n|\\r|\\n/g, " ").trim();
-    if (/[",\\r\\n]/.test(normalized)) {
-      return '"' + normalized.replace(/"/g, '""') + '"';
-    }
-    return normalized;
-  }
-
-  function includeHeadersEnabled() {
-    const toggle = document.querySelector(".include-headers-toggle");
-    return Boolean(toggle && toggle.checked);
-  }
-
-  window.buildCsvPayload = function (forceHeaders) {
-    const metaControls = getSortedControls("metadata");
-    const checkControls = getSortedControls("checkbox");
-
-    const headers = [];
-    const values = [];
-
-    metaControls.forEach(function (ctrl) {
-      headers.push(ctrl.getAttribute("data-csv-header") || ctrl.id);
-      values.push(ctrl.value || "");
-    });
-
-    checkControls.forEach(function (ctrl) {
-      headers.push(ctrl.getAttribute("data-csv-header") || ctrl.id);
-      const checkedVal = ctrl.getAttribute("data-checked-value") || "Pass";
-      const uncheckedVal = ctrl.getAttribute("data-unchecked-value") || "Fail";
-      values.push(ctrl.checked ? checkedVal : uncheckedVal);
-    });
-
-    const dataRow = values.map(escapeCsvCell).join(",");
-    const withHeaders =
-      typeof forceHeaders === "boolean" ? forceHeaders : includeHeadersEnabled();
-
-    if (withHeaders) {
-      const headerRow = headers.map(escapeCsvCell).join(",");
-      return headerRow + "\\r\\n" + dataRow;
-    }
-    return dataRow;
+  window.buildCsvPayload = force => {
+    const meta = byOrder("metadata"), checks = byOrder("checkbox");
+    const headers = [...meta, ...checks].map(el => el.dataset.csvHeader || el.id);
+    const vals = [...meta.map(el => el.value || ""), ...checks.map(el => el.checked ? (el.dataset.checkedValue || "Pass") : (el.dataset.uncheckedValue || "Fail"))];
+    const row = vals.map(csvCell).join(",");
+    const inc = typeof force === "boolean" ? force : Boolean(document.querySelector(".include-headers-toggle")?.checked);
+    return inc ? headers.map(csvCell).join(",") + "\\r\\n" + row : row;
   };
 
-  function showToolbarStatus(triggerEl, message, isError) {
-    const toolbars = document.querySelectorAll(".qa-toolbar");
-    const targetToolbar = triggerEl ? triggerEl.closest(".qa-toolbar") : null;
-    const targets = targetToolbar ? [targetToolbar] : Array.from(toolbars);
-
-    targets.forEach(function (tb) {
-      const msgEl = tb.querySelector(".qa-status-msg");
-      if (!msgEl) return;
-      msgEl.textContent = message;
-      msgEl.style.color = isError ? "#be123c" : "#047857";
-      if (msgEl._clearTimer) {
-        clearTimeout(msgEl._clearTimer);
-      }
-      msgEl._clearTimer = setTimeout(function () {
-        msgEl.textContent = "";
-      }, 3500);
+  function flash(btn, msg, err) {
+    (btn?.closest(".qa-toolbar") ? [btn.closest(".qa-toolbar")] : [...document.querySelectorAll(".qa-toolbar")]).forEach(tb => {
+      const el = tb.querySelector(".qa-status-msg");
+      if (!el) return;
+      el.textContent = msg; el.style.color = err ? "#be123c" : "#047857";
+      clearTimeout(el._t); el._t = setTimeout(() => { el.textContent = ""; }, 3500);
     });
   }
 
-  window.syncHeaderToggles = function (sourceToggle) {
-    const checked = Boolean(sourceToggle && sourceToggle.checked);
-    document.querySelectorAll(".include-headers-toggle").forEach(function (el) {
-      el.checked = checked;
-    });
-  };
+  window.syncHeaderToggles = src => document.querySelectorAll(".include-headers-toggle").forEach(el => { el.checked = Boolean(src?.checked); });
 
-  function syncInputsForPrint() {
-    document.querySelectorAll("input.qa-input").forEach(function (inp) {
-      inp.setAttribute("value", inp.value);
-      if (inp.hasAttribute("placeholder")) {
-        inp.setAttribute("data-orig-placeholder", inp.getAttribute("placeholder") || "");
-        inp.removeAttribute("placeholder");
-      }
+  function syncPrint() {
+    document.querySelectorAll("input.qa-input, textarea.qa-textarea").forEach(el => {
+      if (el.tagName === "INPUT") el.setAttribute("value", el.value);
+      else { el.style.height = "auto"; el.style.height = Math.max(76, el.scrollHeight + 4) + "px"; }
+      if (el.hasAttribute("placeholder")) { el.dataset.origPh = el.getAttribute("placeholder") || ""; el.removeAttribute("placeholder"); }
     });
-    document.querySelectorAll("textarea.qa-textarea").forEach(function (ta) {
-      ta.style.height = "auto";
-      ta.style.height = Math.max(76, ta.scrollHeight + 4) + "px";
-      if (ta.hasAttribute("placeholder")) {
-        ta.setAttribute("data-orig-placeholder", ta.getAttribute("placeholder") || "");
-        ta.removeAttribute("placeholder");
-      }
-    });
-    document.querySelectorAll("input.qa-checkbox").forEach(function (cb) {
-      if (cb.checked) {
-        cb.setAttribute("checked", "checked");
-      } else {
-        cb.removeAttribute("checked");
-      }
-    });
+    document.querySelectorAll("input.qa-checkbox").forEach(cb => cb.checked ? cb.setAttribute("checked", "checked") : cb.removeAttribute("checked"));
   }
+  function restorePrint() { document.querySelectorAll("[data-orig-ph]").forEach(el => { el.setAttribute("placeholder", el.dataset.origPh || ""); delete el.dataset.origPh; }); }
 
-  function restoreInputsAfterPrint() {
-    document.querySelectorAll("[data-orig-placeholder]").forEach(function (el) {
-      el.setAttribute("placeholder", el.getAttribute("data-orig-placeholder") || "");
-      el.removeAttribute("data-orig-placeholder");
-    });
-  }
+  window.exportPdf = () => { syncPrint(); window.print(); restorePrint(); };
 
-  window.exportPdf = function () {
-    syncInputsForPrint();
-    window.print();
-    restoreInputsAfterPrint();
+  window.downloadCsvRow = btn => {
+    const sn = (document.querySelector('[data-csv-header="Board Serial Number"]')?.value || "").trim().replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+    const name = "QA_Results_" + (sn || new Date().toISOString().slice(0, 10)) + ".csv";
+    const url = URL.createObjectURL(new Blob([window.buildCsvPayload() + "\\r\\n"], { type: "text/csv;charset=utf-8;" }));
+    const a = Object.assign(document.createElement("a"), { href: url, download: name });
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    flash(btn, "Downloaded " + name, false);
   };
 
-  function getSerialFilenameSlug() {
-    const serialInput = document.querySelector(
-      '[data-csv-header="Board Serial Number"]'
-    );
-    const raw = serialInput && serialInput.value ? serialInput.value.trim() : "";
-    if (raw) {
-      const clean = raw.replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
-      if (clean) return clean;
-    }
-    return new Date().toISOString().slice(0, 10);
-  }
-
-  window.downloadCsvRow = function (btnEl) {
-    const csvText = window.buildCsvPayload();
-    const filename = "QA_Results_" + getSerialFilenameSlug() + ".csv";
-    const blob = new Blob([csvText + "\\r\\n"], {
-      type: "text/csv;charset=utf-8;",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(function () {
-      URL.revokeObjectURL(url);
-    }, 1000);
-    showToolbarStatus(btnEl, "Downloaded " + filename, false);
+  window.copyCsvRow = btn => {
+    const text = window.buildCsvPayload();
+    const fallback = () => {
+      const ta = Object.assign(document.createElement("textarea"), { value: text });
+      ta.style.cssText = "position:fixed;left:-9999px"; document.body.appendChild(ta); ta.select();
+      try { flash(btn, document.execCommand("copy") ? "Copied CSV row to clipboard!" : "Copy blocked.", false); } catch (e) { flash(btn, "Copy failed: " + e, true); }
+      ta.remove();
+    };
+    (navigator.clipboard && window.isSecureContext) ? navigator.clipboard.writeText(text).then(() => flash(btn, "Copied CSV row to clipboard!", false)).catch(fallback) : fallback();
   };
 
-  window.copyCsvRow = function (btnEl) {
-    const csvText = window.buildCsvPayload();
-
-    function fallbackCopy() {
-      const temp = document.createElement("textarea");
-      temp.value = csvText;
-      temp.setAttribute("readonly", "");
-      temp.style.position = "fixed";
-      temp.style.left = "-9999px";
-      document.body.appendChild(temp);
-      temp.select();
-      try {
-        const ok = document.execCommand("copy");
-        if (ok) {
-          showToolbarStatus(btnEl, "Copied CSV row to clipboard!", false);
-        } else {
-          showToolbarStatus(btnEl, "Clipboard copy blocked by browser.", true);
-        }
-      } catch (err) {
-        showToolbarStatus(btnEl, "Copy failed: " + err, true);
-      }
-      document.body.removeChild(temp);
-    }
-
-    if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard
-        .writeText(csvText)
-        .then(function () {
-          showToolbarStatus(btnEl, "Copied CSV row to clipboard!", false);
-        })
-        .catch(fallbackCopy);
-    } else {
-      fallbackCopy();
-    }
-  };
-
-  window.clearQaForm = function () {
+  window.clearQaForm = () => {
     const form = document.getElementById("qa-form");
-    if (!form) return;
-    const hasData = Array.from(
-      form.querySelectorAll("input.qa-input, textarea.qa-textarea, input.qa-checkbox")
-    ).some(function (el) {
-      return el.type === "checkbox" ? el.checked : Boolean(el.value);
-    });
-    if (hasData && !window.confirm("Clear all entered QA measurements and checkboxes?")) {
-      return;
-    }
+    if ([...form.querySelectorAll("input.qa-input, textarea.qa-textarea, input.qa-checkbox")].some(el => el.type === "checkbox" ? el.checked : Boolean(el.value)) && !window.confirm("Clear all entered QA measurements and checkboxes?")) return;
     form.reset();
-    document.querySelectorAll("input.qa-input").forEach(function (inp) {
-      inp.value = "";
-      inp.removeAttribute("value");
-    });
-    document.querySelectorAll("textarea.qa-textarea").forEach(function (ta) {
-      ta.value = "";
-      ta.style.height = "";
-    });
-    document.querySelectorAll("input.qa-checkbox").forEach(function (cb) {
-      cb.checked = false;
-      cb.removeAttribute("checked");
-    });
-    updateProgressBadges();
-    showToolbarStatus(null, "Form cleared.", false);
+    document.querySelectorAll("input.qa-input, textarea.qa-textarea").forEach(el => { el.value = ""; el.removeAttribute("value"); el.style.height = ""; });
+    document.querySelectorAll("input.qa-checkbox").forEach(cb => { cb.checked = false; cb.removeAttribute("checked"); });
+    updateProgress(); flash(null, "Form cleared.", false);
   };
 
-  function updateProgressBadges() {
-    const boxes = getSortedControls("checkbox");
-    const total = boxes.length;
-    const checked = boxes.filter(function (cb) {
-      return cb.checked;
-    }).length;
-    document.querySelectorAll(".qa-progress-badge").forEach(function (badge) {
-      badge.textContent = checked + " / " + total + " checks verified";
-    });
+  function updateProgress() {
+    const boxes = byOrder("checkbox"), done = boxes.filter(cb => cb.checked).length;
+    document.querySelectorAll(".qa-progress-badge").forEach(b => { b.textContent = done + " / " + boxes.length + " checks verified"; });
   }
 
-  document.addEventListener("DOMContentLoaded", function () {
-    updateProgressBadges();
-    document.querySelectorAll("input.qa-checkbox").forEach(function (cb) {
-      cb.addEventListener("change", updateProgressBadges);
-    });
-    document.querySelectorAll("textarea.qa-textarea").forEach(function (ta) {
-      ta.addEventListener("input", function () {
-        ta.style.height = "auto";
-        ta.style.height = Math.max(76, ta.scrollHeight + 4) + "px";
-      });
-    });
-    window.addEventListener("beforeprint", syncInputsForPrint);
-    window.addEventListener("afterprint", restoreInputsAfterPrint);
+  document.addEventListener("DOMContentLoaded", () => {
+    updateProgress();
+    document.querySelectorAll("input.qa-checkbox").forEach(cb => cb.addEventListener("change", updateProgress));
+    document.querySelectorAll("textarea.qa-textarea").forEach(ta => ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.max(76, ta.scrollHeight + 4) + "px"; }));
+    window.addEventListener("beforeprint", syncPrint);
+    window.addEventListener("afterprint", restorePrint);
   });
 })();
 """
 
 
-def build_full_html(md_text: str, source_name: str = "QA.md", git_rev: str = "") -> str:
-    """Validate Markdown and assemble the complete self-contained QA.html document."""
-    validate_markdown(md_text, source_name=source_name)
-    doc_title, body_html, ctx = convert_markdown_body(md_text)
-
-    total_checks = len(ctx.checkbox_headers)
-    initial_checked = body_html.count('class="qa-checkbox" checked')
-
-    top_toolbar = TOOLBAR_HTML.format(
-        position="Top",
-        initial_checked=initial_checked,
-        total_checks=total_checks,
-    )
-    bottom_toolbar = TOOLBAR_HTML.format(
-        position="Bottom",
-        initial_checked=initial_checked,
-        total_checks=total_checks,
-    )
-
-    rev_text = (
-        f"Generated from <code>documentation/QA.md</code> &middot; Commit <code>{html.escape(git_rev)}</code>"
-        if git_rev
-        else "Generated from <code>documentation/QA.md</code>"
-    )
-    rev_note = (
-        f'<div class="qa-doc-meta">'
-        f"<span>{rev_text}</span>"
-        f'<a href="./" class="qa-back-link no-print">&larr; Back to Project Outputs</a>'
-        f"</div>"
-    )
-
-    # Insert revision note and top toolbar immediately after <h1> if present
-    h1_close = "</h1>"
-    if h1_close in body_html:
-        first_h1_end = body_html.index(h1_close) + len(h1_close)
-        body_with_top = (
-            body_html[:first_h1_end]
-            + "\n"
-            + rev_note
-            + "\n"
-            + top_toolbar
-            + body_html[first_h1_end:]
-        )
-    else:
-        body_with_top = rev_note + "\n" + top_toolbar + "\n" + body_html
-
-    esc_title = html.escape(doc_title)
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{esc_title}</title>
-  <style>
-{PAGE_CSS}  </style>
-</head>
-<body>
-  <main class="qa-container">
-    <form id="qa-form" onsubmit="return false;" autocomplete="off">
-{body_with_top}
-{bottom_toolbar}
-    </form>
-  </main>
-  <script>
-{PAGE_JS}  </script>
-</body>
-</html>
-"""
+# Strip inline Markdown markers to plain text.
+def plain_text(text: str) -> str:
+    s = re.sub(r"`([^`]+)`|\[([^\]]+)\]\([^)]+\)", lambda m: m.group(1) or m.group(2), text)
+    return " ".join(re.sub(r"(\*\*|__|\*|_)(.+?)\1", r"\2", s).split())
 
 
-KIBOT_QA_ICON_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="QA Procedure">'
-    '<rect x="38" y="28" width="180" height="208" rx="18" fill="#f8fafc" stroke="#0e4e8e" stroke-width="10"/>'
-    '<rect x="86" y="14" width="84" height="30" rx="10" fill="#0e4e8e"/>'
-    '<circle cx="128" cy="29" r="5" fill="#ffffff"/>'
-    '<rect x="66" y="76" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
-    '<path d="M72 90 l7 7 l12 -14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
-    '<rect x="110" y="84" width="80" height="12" rx="6" fill="#0e4e8e"/>'
-    '<rect x="66" y="124" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
-    '<path d="M72 138 l7 7 l12 -14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
-    '<rect x="110" y="132" width="80" height="12" rx="6" fill="#0e4e8e"/>'
-    '<rect x="66" y="172" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
-    '<path d="M72 186 l7 7 l12 -14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
-    '<rect x="110" y="180" width="60" height="12" rx="6" fill="#0e4e8e"/>'
-    "</svg>"
-)
+# Render inline Markdown (code, links, bold, italic) to safe HTML.
+def render_inline(text: str) -> str:
+    s = html.escape(text, quote=False)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>', s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    return re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", s)
 
 
-def _find_matching_close_tag(html_str: str, open_pos: int, tag_name: str) -> int:
-    """Return index of the matching closing tag starting from open_pos, or -1."""
-    tag_re = re.compile(rf"<(/?){re.escape(tag_name)}\b[^>]*>", re.IGNORECASE)
-    depth = 0
-    for match in tag_re.finditer(html_str, open_pos):
-        if match.group(1) == "/":
-            depth -= 1
-            if depth == 0:
-                return match.start()
+# Split a Markdown table row into trimmed cell strings.
+def split_row(line: str) -> list[str]:
+    return [c.replace(r"\|", "|").strip() for c in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+
+
+# Check if a line is a Markdown table alignment separator.
+def is_sep_row(line: str) -> bool:
+    cells = split_row(line) if "|" in line else []
+    return bool(cells) and all(re.match(r"^:?-{2,}:?$", c) for c in cells)
+
+
+# Ensure QA.md has no raw HTML tags and only places checkboxes on Pass/Complete items.
+def validate_markdown(md_text: str, source_name: str = "QA.md") -> None:
+    in_fence, errors = False, []
+    for n, line in enumerate(md_text.splitlines(), 1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if m := TAG_RE.search(line):
+            errors.append(f"{source_name}:{n}: Raw HTML found: {m.group(0)!r}")
+        if (lm := LIST_RE.match(line)) and (cm := CHECK_RE.match(lm.group(3))):
+            if not re.search(r"\b(pass|complete)\b", plain_text(cm.group(2)), re.I):
+                errors.append(f"{source_name}:{n}: Checkbox on non-Pass/Complete item: {cm.group(2)!r}")
+        elif "|" in line and not is_sep_row(line):
+            for cell in split_row(line):
+                if (cm := CELL_CHECK_RE.match(cell)) and not re.search(r"\b(pass|complete)\b", plain_text(f"{cm.group(1)} {cm.group(3)}"), re.I):
+                    errors.append(f"{source_name}:{n}: Table checkbox on non-Pass/Complete cell: {cell!r}")
+    if errors:
+        raise ValueError("Markdown validation failed:\n  - " + "\n  - ".join(errors))
+
+
+# Convert validated Markdown into (title, html_body, checkbox_count).
+def convert_markdown(md_text: str) -> tuple[str, str, int]:
+    lines = md_text.splitlines()
+    used_ids: set[str] = set()
+    seq = order = checks = 0
+    cur_h3, title, in_sec, in_fence = "", "Quality Assurance Procedure", False, False
+    blocks: list[str] = []
+    fence: list[str] = []
+
+    def uid(prefix: str, label: str) -> str:
+        nonlocal seq
+        seq += 1
+        slug = re.sub(r"[^a-z0-9]+", "-", plain_text(label).lower()).strip("-") or "item"
+        cid = f"{prefix}-{slug}-{seq}" if f"{prefix}-{slug}" in used_ids else f"{prefix}-{slug}"
+        used_ids.add(cid)
+        return cid
+
+    def next_ord() -> int:
+        nonlocal order
+        order += 1
+        return order * 100
+
+    def pair_for(label: str) -> tuple[str, str]:
+        low = label.lower()
+        return ("Complete", "Incomplete") if ("complete" in low and "pass" not in low) else ("Pass", "Fail")
+
+    # Render a single list item (checkbox, metadata field, or procedural step).
+    def make_li(rest: str) -> tuple[str, str]:
+        nonlocal checks
+        if cm := CHECK_RE.match(rest):
+            checks += 1
+            plain = plain_text(cm.group(2))
+            t_val, f_val = pair_for(plain)
+            cid, chk = uid("chk", plain), (" checked" if cm.group(1).lower() == "x" else "")
+            return "qa-outcome-list", f'<li class="qa-check-item"><label class="qa-check-label" for="{cid}"><input type="checkbox" id="{cid}" class="qa-checkbox"{chk} data-csv-role="checkbox" data-csv-header="{html.escape(plain, True)}" data-checked-value="{t_val}" data-unchecked-value="{f_val}" data-csv-order="{next_ord()}"><span class="qa-check-text">{render_inline(cm.group(2))}</span></label></li>'
+        if mm := META_RE.match(rest):
+            clean = plain_text(mm.group(1)).rstrip(":").strip()
+            low = clean.lower()
+            hdr = f"{cur_h3} - {clean}" if (low in GENERIC_LABELS and cur_h3 and cur_h3.lower() not in {"qa metadata", "final result"}) else clean
+            cid, ord_v = uid("meta", hdr), next_ord()
+            ph = html.escape(next((v for k, v in HINTS if k in low), ""), True)
+            eh, el = html.escape(hdr, True), html.escape(clean)
+            if "date" in low:
+                return "qa-meta-list", f'<li class="qa-meta-item"><label class="qa-meta-label" for="{cid}"><strong>{el}:</strong></label><input type="date" id="{cid}" class="qa-input qa-date-input" data-csv-role="metadata" data-csv-header="{eh}" data-csv-order="{ord_v}"></li>'
+            if any(k in low for k in ("deviations", "waivers", "comments")):
+                return "qa-meta-list", f'<li class="qa-meta-item qa-meta-block"><label class="qa-meta-label" for="{cid}"><strong>{el}:</strong></label><textarea id="{cid}" class="qa-input qa-textarea" rows="3" placeholder="{ph}" data-csv-role="metadata" data-csv-header="{eh}" data-csv-order="{ord_v}"></textarea></li>'
+            wide = " qa-input-wide" if ("notes" in low or "defects" in low) else ""
+            return "qa-meta-list", f'<li class="qa-meta-item"><label class="qa-meta-label" for="{cid}"><strong>{el}:</strong></label><input type="text" id="{cid}" class="qa-input{wide}" placeholder="{ph}" data-csv-role="metadata" data-csv-header="{eh}" data-csv-order="{ord_v}"></li>'
+        return "qa-step-list", f"<li>{render_inline(rest)}</li>"
+
+    idx = 0
+    while idx < len(lines):
+        line, stripped = lines[idx], lines[idx].strip()
+        if stripped.startswith("```"):
+            if in_fence:
+                blocks.append(f"<pre><code>{html.escape(chr(10).join(fence))}</code></pre>")
+                fence.clear()
+            in_fence = not in_fence
+            idx += 1
+        elif in_fence:
+            fence.append(line)
+            idx += 1
+        elif not stripped:
+            idx += 1
+        elif HR_RE.match(stripped):
+            if in_sec:
+                blocks.append("</section>")
+                in_sec = False
+            blocks.append("<hr>")
+            idx += 1
+        elif hm := HEAD_RE.match(line):
+            lvl, h_raw = len(hm.group(1)), hm.group(2)
+            h_plain = plain_text(h_raw)
+            if lvl == 1 and title == "Quality Assurance Procedure":
+                title = h_plain
+            elif lvl in (2, 3):
+                cur_h3 = h_plain if lvl == 3 else ""
+                if in_sec:
+                    blocks.append("</section>")
+                blocks.append('<section class="qa-section">')
+                in_sec = True
+            blocks.append(f'<h{lvl} id="{uid("sec", h_plain)}">{render_inline(h_raw)}</h{lvl}>')
+            idx += 1
+        elif "|" in line and idx + 1 < len(lines) and is_sep_row(lines[idx + 1]):
+            headers = split_row(lines[idx])
+            idx += 2
+            rows = []
+            while idx < len(lines) and lines[idx].strip() and "|" in lines[idx]:
+                rows.append(split_row(lines[idx]))
+                idx += 1
+            base_ord = next_ord()
+            has_ch = any(CH_RE.search(c) for r in rows for c in r if CELL_CHECK_RE.match(c))
+            if has_ch:
+                order += len(rows) * max(1, len(headers))
+            tbl = ['<div class="qa-table-wrap"><table class="qa-table"><thead><tr>' + "".join(f"<th>{render_inline(h)}</th>" for h in headers) + "</tr></thead><tbody>"]
+            for row in rows:
+                rkey = plain_text(row[0]) if row else ""
+                tds = []
+                for c, h_raw in enumerate(headers):
+                    raw, col_h = (row[c] if c < len(row) else ""), plain_text(h_raw)
+                    if cm := CELL_CHECK_RE.match(raw):
+                        checks += 1
+                        pre, suf = cm.group(1).strip(), cm.group(3).strip()
+                        pre_p, suf_p = plain_text(pre).rstrip(":").strip(), plain_text(suf).strip()
+                        csv_h = f"{rkey} {suf_p}".strip() if (not pre_p and rkey and c > 0) else " ".join(x for x in (pre_p, suf_p) if x)
+                        ch_m = CH_RE.search(csv_h)
+                        ord_v = (base_ord + int(ch_m.group(1))) if (has_ch and ch_m) else next_ord()
+                        t_val, f_val = pair_for(csv_h)
+                        cid, chk = uid("chk", csv_h), (" checked" if cm.group(2).lower() == "x" else "")
+                        pre_h = f'<span class="qa-cell-prefix">{render_inline(pre)}</span> ' if pre else ""
+                        suf_h = f'<span class="qa-check-text">{render_inline(suf)}</span>' if suf else ""
+                        tds.append(f'<td><label class="qa-check-label qa-table-check" for="{cid}">{pre_h}<input type="checkbox" id="{cid}" class="qa-checkbox"{chk} data-csv-role="checkbox" data-csv-header="{html.escape(csv_h, True)}" data-checked-value="{t_val}" data-unchecked-value="{f_val}" data-csv-order="{ord_v}">{suf_h}</label></td>')
+                    elif not raw and any(k in col_h.lower() for k in FILLABLE_COLS):
+                        sec = f"{cur_h3} " if cur_h3 else ""
+                        cid = uid("tbl", f"{sec}{rkey}-{col_h}")
+                        ph = "Enter value..." if "measured" in col_h.lower() else "Optional notes..."
+                        tds.append(f'<td><input type="text" id="{cid}" class="qa-input qa-table-input" aria-label="{html.escape(f"{sec}{rkey} {col_h}".strip(), True)}" placeholder="{ph}"></td>')
+                    else:
+                        tds.append(f"<td>{render_inline(raw)}</td>")
+                tbl.append("<tr>" + "".join(tds) + "</tr>")
+            tbl.append("</tbody></table></div>")
+            blocks.append("\n".join(tbl))
+        elif LIST_RE.match(line):
+            groups: list[tuple[str, str, list[str]]] = []
+            while idx < len(lines) and lines[idx].strip() and (lm := LIST_RE.match(lines[idx])):
+                ind, marker, rest = len(lm.group(1).expandtabs(4)), lm.group(2), lm.group(3)
+                idx += 1
+                if ind > 0 and groups and groups[-1][2]:
+                    sub = [f"<li>{render_inline(rest)}</li>"]
+                    while idx < len(lines) and lines[idx].strip() and (sm := LIST_RE.match(lines[idx])) and len(sm.group(1).expandtabs(4)) > 0:
+                        sub.append(f"<li>{render_inline(sm.group(3))}</li>")
+                        idx += 1
+                    groups[-1][2][-1] = groups[-1][2][-1][:-5] + f'<ul class="qa-step-list">{"".join(sub)}</ul></li>'
+                else:
+                    tag = "ol" if marker.endswith(".") else "ul"
+                    cls, li_html = make_li(rest)
+                    if not groups or groups[-1][0] != tag or groups[-1][1] != cls:
+                        groups.append((tag, cls, []))
+                    groups[-1][2].append(li_html)
+            blocks.extend(f'<{t} class="{c}">\n' + "\n".join(items) + f"\n</{t}>" for t, c, items in groups)
         else:
-            depth += 1
+            para = []
+            while idx < len(lines):
+                cur, cs = lines[idx], lines[idx].strip()
+                if not cs or cs.startswith("```") or HR_RE.match(cs) or HEAD_RE.match(cur) or LIST_RE.match(cur) or ("|" in cur and idx + 1 < len(lines) and is_sep_row(lines[idx + 1])):
+                    break
+                para.append(cs)
+                idx += 1
+            blocks.append(f"<p>{render_inline(' '.join(para))}</p>")
+
+    if in_sec:
+        blocks.append("</section>")
+    return title, "\n".join(blocks), checks
+
+
+# Assemble the full standalone QA.html document.
+def build_full_html(md_text: str, source_name: str = "QA.md", git_rev: str = "") -> str:
+    validate_markdown(md_text, source_name=source_name)
+    title, body, total = convert_markdown(md_text)
+    checked = body.count('class="qa-checkbox" checked')
+    top_bar = TOOLBAR_HTML.format(pos="Top", checked=checked, total=total)
+    bot_bar = TOOLBAR_HTML.format(pos="Bottom", checked=checked, total=total)
+    rev = f" &middot; Commit <code>{html.escape(git_rev)}</code>" if git_rev else ""
+    meta = f'<div class="qa-doc-meta"><span>Generated from <code>documentation/QA.md</code>{rev}</span><a href="./" class="qa-back-link no-print">&larr; Back to Project Outputs</a></div>'
+    body = body.replace("</h1>", f"</h1>\n{meta}\n{top_bar}", 1) if "</h1>" in body else f"{meta}\n{top_bar}\n{body}"
+    return f'<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>{html.escape(title)}</title>\n<style>{PAGE_CSS}</style>\n</head>\n<body>\n<main class="qa-container">\n<form id="qa-form" onsubmit="return false;" autocomplete="off">\n{body}\n{bot_bar}\n</form>\n</main>\n<script>{PAGE_JS}</script>\n</body>\n</html>\n'
+
+
+# Find matching closing tag index accounting for nested tags.
+def find_close_tag(text: str, start: int, tag: str) -> int:
+    depth = 0
+    for m in re.finditer(rf"<(/?){tag}\b[^>]*>", text, re.I):
+        if m.start() >= start:
+            depth += -1 if m.group(1) == "/" else 1
+            if depth == 0:
+                return m.start()
     return -1
 
 
+# Inject QA Procedure tile and sidebar link into KiBot *-navigate*.html pages.
 def inject_kibot_navigation(nav_dir: pathlib.Path, qa_href: str = "QA.html") -> int:
-    """Inject QA Procedure card and sidebar link into KiBot *-navigate*.html pages."""
     if not nav_dir.is_dir():
         return 0
-
-    esc_href = html.escape(qa_href, quote=True)
-    sidenav_item = (
-        f'  <li style="margin-top: 14px;"><a href="{esc_href}">QA Procedure</a></li>\n'
-    )
-    tile_td = (
-        f' <td><a href="{esc_href}"><table class="cat-img"><tr><td>'
-        f"{KIBOT_QA_ICON_SVG}<br>QA Procedure"
-        f"</td></tr></table></a></td>\n"
-    )
-
-    updated_count = 0
-    for nav_file in sorted(nav_dir.glob("*-navigate*.html")):
-        content = nav_file.read_text(encoding="utf-8")
-        if f'href="{esc_href}"' in content:
+    href = html.escape(qa_href, True)
+    nav_li = f'  <li style="margin-top: 14px;"><a href="{href}">QA Procedure</a></li>\n'
+    tile = f' <td><a href="{href}"><table class="cat-img"><tr><td>{KIBOT_QA_SVG}<br>QA Procedure</td></tr></table></a></td>\n'
+    count = 0
+    for path in sorted(nav_dir.glob("*-navigate*.html")):
+        src = path.read_text(encoding="utf-8")
+        if f'href="{href}"' in src:
             continue
-
-        modified = content
-
-        # 1. Inject link into #theSideNav across all KiBot navigation pages
-        sidenav_match = re.search(r'<div\s+id="theSideNav"[^>]*>', modified)
-        if sidenav_match:
-            sidenav_close = _find_matching_close_tag(
-                modified, sidenav_match.start(), "div"
-            )
-            if sidenav_close != -1:
-                last_ul_close = modified.rfind("</ul>", sidenav_match.start(), sidenav_close)
-                if last_ul_close != -1:
-                    modified = (
-                        modified[:last_ul_close]
-                        + sidenav_item
-                        + modified[last_ul_close:]
-                    )
-
-        # 2. Inject 1-click QA Procedure tile into <table class="cat-table"> on the main page
-        cat_match = re.search(r'<table\s+class="cat-table"[^>]*>', modified)
-        if cat_match:
-            cat_close = _find_matching_close_tag(modified, cat_match.start(), "table")
-            if cat_close != -1:
-                last_tr_close = modified.rfind("</tr>", cat_match.start(), cat_close)
-                if last_tr_close != -1:
-                    modified = (
-                        modified[:last_tr_close] + tile_td + modified[last_tr_close:]
-                    )
-
-        if modified != content:
-            nav_file.write_text(modified, encoding="utf-8")
-            updated_count += 1
-
-    return updated_count
+        out = src
+        if sm := re.search(r'<div\s+id="theSideNav"[^>]*>', out):
+            end = find_close_tag(out, sm.start(), "div")
+            if end != -1 and (pos := out.rfind("</ul>", sm.start(), end)) != -1:
+                out = out[:pos] + nav_li + out[pos:]
+        if cm := re.search(r'<table\s+class="cat-table"[^>]*>', out):
+            end = find_close_tag(out, cm.start(), "table")
+            if end != -1 and (pos := out.rfind("</tr>", cm.start(), end)) != -1:
+                out = out[:pos] + tile + out[pos:]
+        if out != src:
+            path.write_text(out, encoding="utf-8")
+            count += 1
+    return count
 
 
+# CLI entry point.
 def main(argv: list[str] | None = None) -> int:
-    repo_root = pathlib.Path(__file__).resolve().parent.parent
-    default_input = repo_root / "documentation" / "QA.md"
-    default_output = repo_root / "documentation" / "QA.html"
-
-    parser = argparse.ArgumentParser(
-        description="Convert clean documentation/QA.md into an interactive QA.html page."
-    )
-    parser.add_argument(
-        "input",
-        nargs="?",
-        type=pathlib.Path,
-        default=default_input,
-        help="Path to clean Markdown QA procedure (default: documentation/QA.md)",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=pathlib.Path,
-        default=default_output,
-        help="Output path for generated HTML (default: documentation/QA.html)",
-    )
-    parser.add_argument(
-        "--inject-nav",
-        type=pathlib.Path,
-        default=None,
-        help="Directory containing KiBot *-navigate*.html files to link to QA.html.",
-    )
-    parser.add_argument(
-        "--check-only",
-        action="store_true",
-        help="Validate QA.md and test conversion without writing an output file.",
-    )
-    args = parser.parse_args(argv)
+    root = pathlib.Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(description="Generate interactive QA.html from QA.md.")
+    ap.add_argument("input", nargs="?", type=pathlib.Path, default=root / "documentation" / "QA.md")
+    ap.add_argument("-o", "--output", type=pathlib.Path, default=root / "documentation" / "QA.html")
+    ap.add_argument("--inject-nav", type=pathlib.Path, default=None)
+    ap.add_argument("--check-only", action="store_true")
+    args = ap.parse_args(argv)
 
     if not args.input.is_file():
         print(f"Error: Input file not found: {args.input}", file=sys.stderr)
         return 1
 
-    md_text = args.input.read_text(encoding="utf-8")
-    git_rev = detect_git_revision(args.input.resolve().parent)
+    res = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=args.input.resolve().parent, capture_output=True, text=True)
+    git_rev = res.stdout.strip() if res.returncode == 0 else ""
 
     try:
-        full_html = build_full_html(
-            md_text, source_name=str(args.input), git_rev=git_rev
-        )
+        full_html = build_full_html(args.input.read_text(encoding="utf-8"), str(args.input), git_rev)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -1681,14 +486,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Generated {args.output} from {args.input}")
 
     if args.inject_nav is not None:
-        qa_rel = args.output.name
-        try:
-            qa_rel = args.output.resolve().relative_to(args.inject_nav.resolve()).as_posix()
-        except ValueError:
-            pass
-        injected = inject_kibot_navigation(args.inject_nav, qa_href=qa_rel)
-        print(f"Injected QA navigation links into {injected} KiBot page(s) in {args.inject_nav}")
-
+        rel = args.output.resolve().relative_to(args.inject_nav.resolve()).as_posix() if args.inject_nav.resolve() in args.output.resolve().parents else args.output.name
+        print(f"Injected QA navigation links into {inject_kibot_navigation(args.inject_nav, rel)} KiBot page(s)")
     return 0
 
 
