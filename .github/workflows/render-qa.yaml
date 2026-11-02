@@ -1,0 +1,35 @@
+name: QA HTML Build and Validation
+
+on:
+  push:
+    paths:
+      - 'documentation/QA.md'
+      - 'scripts/generate_qa_html.py'
+      - '.github/workflows/render-qa.yaml'
+  pull_request:
+    paths:
+      - 'documentation/QA.md'
+      - 'scripts/generate_qa_html.py'
+      - '.github/workflows/render-qa.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-qa:
+    name: Validate QA.md and Build QA.html
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Generate and Validate QA.html
+        run: python3 scripts/generate_qa_html.py documentation/QA.md -o build/QA.html
+
+      - name: Upload QA.html Preview Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: QA-html
+          path: build/QA.html
+          if-no-files-found: 'error'

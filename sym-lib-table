@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "evr-fmc")(type "KiCad")(uri "${KIPRJMOD}/libs/Symbol/evr-fmc.kicad_sym")(options "")(descr ""))
+)
