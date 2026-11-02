@@ -759,10 +759,25 @@ body {
 }
 
 .qa-doc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px 16px;
   font-size: 0.85rem;
   color: var(--text-muted);
   margin-top: -8px;
   margin-bottom: 18px;
+}
+
+.qa-back-link {
+  font-weight: 600;
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.qa-back-link:hover {
+  text-decoration: underline;
 }
 
 h1, h2, h3, h4, h5, h6 {
@@ -1468,11 +1483,16 @@ def build_full_html(md_text: str, source_name: str = "QA.md", git_rev: str = "")
         total_checks=total_checks,
     )
 
-    rev_note = (
-        f'<div class="qa-doc-meta">Generated from <code>documentation/QA.md</code>'
-        f' &middot; Commit <code>{html.escape(git_rev)}</code></div>'
+    rev_text = (
+        f"Generated from <code>documentation/QA.md</code> &middot; Commit <code>{html.escape(git_rev)}</code>"
         if git_rev
-        else '<div class="qa-doc-meta">Generated from <code>documentation/QA.md</code></div>'
+        else "Generated from <code>documentation/QA.md</code>"
+    )
+    rev_note = (
+        f'<div class="qa-doc-meta">'
+        f"<span>{rev_text}</span>"
+        f'<a href="./" class="qa-back-link no-print">&larr; Back to Project Outputs</a>'
+        f"</div>"
     )
 
     # Insert revision note and top toolbar immediately after <h1> if present
@@ -1514,6 +1534,94 @@ def build_full_html(md_text: str, source_name: str = "QA.md", git_rev: str = "")
 """
 
 
+KIBOT_QA_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="QA Procedure">'
+    '<rect x="38" y="28" width="180" height="208" rx="18" fill="#f8fafc" stroke="#0e4e8e" stroke-width="10"/>'
+    '<rect x="86" y="14" width="84" height="30" rx="10" fill="#0e4e8e"/>'
+    '<circle cx="128" cy="29" r="5" fill="#ffffff"/>'
+    '<rect x="66" y="76" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
+    '<path d="M72 90 l7 7 l12 -14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<rect x="110" y="84" width="80" height="12" rx="6" fill="#0e4e8e"/>'
+    '<rect x="66" y="124" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
+    '<path d="M72 138 l7 7 l12 -14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<rect x="110" y="132" width="80" height="12" rx="6" fill="#0e4e8e"/>'
+    '<rect x="66" y="172" width="28" height="28" rx="6" fill="#ecfdf5" stroke="#047857" stroke-width="5"/>'
+    '<path d="M72 186 l7 7 l12 -14" fill="none" stroke="#047857" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<rect x="110" y="180" width="60" height="12" rx="6" fill="#0e4e8e"/>'
+    "</svg>"
+)
+
+
+def _find_matching_close_tag(html_str: str, open_pos: int, tag_name: str) -> int:
+    """Return index of the matching closing tag starting from open_pos, or -1."""
+    tag_re = re.compile(rf"<(/?){re.escape(tag_name)}\b[^>]*>", re.IGNORECASE)
+    depth = 0
+    for match in tag_re.finditer(html_str, open_pos):
+        if match.group(1) == "/":
+            depth -= 1
+            if depth == 0:
+                return match.start()
+        else:
+            depth += 1
+    return -1
+
+
+def inject_kibot_navigation(nav_dir: pathlib.Path, qa_href: str = "QA.html") -> int:
+    """Inject QA Procedure card and sidebar link into KiBot *-navigate*.html pages."""
+    if not nav_dir.is_dir():
+        return 0
+
+    esc_href = html.escape(qa_href, quote=True)
+    sidenav_item = (
+        f'  <li style="margin-top: 14px;"><a href="{esc_href}">QA Procedure</a></li>\n'
+    )
+    tile_td = (
+        f' <td><a href="{esc_href}"><table class="cat-img"><tr><td>'
+        f"{KIBOT_QA_ICON_SVG}<br>QA Procedure"
+        f"</td></tr></table></a></td>\n"
+    )
+
+    updated_count = 0
+    for nav_file in sorted(nav_dir.glob("*-navigate*.html")):
+        content = nav_file.read_text(encoding="utf-8")
+        if f'href="{esc_href}"' in content:
+            continue
+
+        modified = content
+
+        # 1. Inject link into #theSideNav across all KiBot navigation pages
+        sidenav_match = re.search(r'<div\s+id="theSideNav"[^>]*>', modified)
+        if sidenav_match:
+            sidenav_close = _find_matching_close_tag(
+                modified, sidenav_match.start(), "div"
+            )
+            if sidenav_close != -1:
+                last_ul_close = modified.rfind("</ul>", sidenav_match.start(), sidenav_close)
+                if last_ul_close != -1:
+                    modified = (
+                        modified[:last_ul_close]
+                        + sidenav_item
+                        + modified[last_ul_close:]
+                    )
+
+        # 2. Inject 1-click QA Procedure tile into <table class="cat-table"> on the main page
+        cat_match = re.search(r'<table\s+class="cat-table"[^>]*>', modified)
+        if cat_match:
+            cat_close = _find_matching_close_tag(modified, cat_match.start(), "table")
+            if cat_close != -1:
+                last_tr_close = modified.rfind("</tr>", cat_match.start(), cat_close)
+                if last_tr_close != -1:
+                    modified = (
+                        modified[:last_tr_close] + tile_td + modified[last_tr_close:]
+                    )
+
+        if modified != content:
+            nav_file.write_text(modified, encoding="utf-8")
+            updated_count += 1
+
+    return updated_count
+
+
 def main(argv: list[str] | None = None) -> int:
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     default_input = repo_root / "documentation" / "QA.md"
@@ -1535,6 +1643,12 @@ def main(argv: list[str] | None = None) -> int:
         type=pathlib.Path,
         default=default_output,
         help="Output path for generated HTML (default: documentation/QA.html)",
+    )
+    parser.add_argument(
+        "--inject-nav",
+        type=pathlib.Path,
+        default=None,
+        help="Directory containing KiBot *-navigate*.html files to link to QA.html.",
     )
     parser.add_argument(
         "--check-only",
@@ -1565,6 +1679,16 @@ def main(argv: list[str] | None = None) -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(full_html, encoding="utf-8")
     print(f"Generated {args.output} from {args.input}")
+
+    if args.inject_nav is not None:
+        qa_rel = args.output.name
+        try:
+            qa_rel = args.output.resolve().relative_to(args.inject_nav.resolve()).as_posix()
+        except ValueError:
+            pass
+        injected = inject_kibot_navigation(args.inject_nav, qa_href=qa_rel)
+        print(f"Injected QA navigation links into {injected} KiBot page(s) in {args.inject_nav}")
+
     return 0
 
 

@@ -14,3 +14,5 @@
 documentation/QA.html
 /output/
 /build/
+__pycache__/
+*.pyc
